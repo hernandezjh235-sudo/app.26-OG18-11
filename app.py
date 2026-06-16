@@ -24210,15 +24210,16 @@ def _v3_batter_research_debug_box(market):
         pass
 
 
-tab_kproj, tab_pitcher_fs, tab_research_hub, tab_batter_fs, tab_hrr, tab_moneyline, tab_mlb30_puller, tab_fs_ud_watcher, tab_iq, tab_30d_learning, tab_learning_lab, tab_calibration, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+# V3 FAST UI: heavy maintenance/debug tabs are hidden from the main workflow.
+# Season data and FS Underdog watcher logic still run through backend/cache paths,
+# but their full debug UIs are not rendered every refresh.
+tab_kproj, tab_pitcher_fs, tab_research_hub, tab_batter_fs, tab_hrr, tab_moneyline, tab_iq, tab_30d_learning, tab_learning_lab, tab_calibration, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "1️⃣ PITCHER K",
     "2️⃣ PITCHER FS",
     "🔎 RESEARCH HUB",
     "3️⃣ BATTER FS",
     "4️⃣ H+R+RBI",
     "MONEYLINE EDGE",
-    "📥 SEASON DATA",
-    "🟣 FS UD WATCHER",
     "🧠 BASEBALL IQ",
     "🧠 30D LEARNING IQ",
     "🧪 LEARNING LAB",
@@ -24250,27 +24251,8 @@ with tab_hrr:
 with tab_moneyline:
     render_moneyline_edge_tab(board, dates)
 
-with tab_mlb30_puller:
-    render_season_to_date_puller()
-
-    try:
-        _mlrd_df = ml_build_board(board)
-        with st.expander("Moneyline Run Differential IQ", expanded=False):
-            _mlrd_cols = [c for c in [
-                "Matchup", "Expected Score", "Expected Run Differential", "Run Differential Pick",
-                "Run Differential Label", "Away Offense vs Hand 30d", "Home Offense vs Hand 30d",
-                "Away Bullpen Run Prevention 14d", "Home Bullpen Run Prevention 14d"
-            ] if c in _mlrd_df.columns]
-            st.dataframe(_mlrd_df[_mlrd_cols], use_container_width=True, hide_index=True)
-    except Exception:
-        pass
-
-with tab_fs_ud_watcher:
-    st.markdown("### 🟣 FS UD Watcher")
-    st.caption("Controls are shown in Pitcher FS to avoid duplicate Streamlit widget IDs.")
-    raw_fs_ud = _fsud_raw_df()
-    if raw_fs_ud is not None and not raw_fs_ud.empty:
-        st.dataframe(raw_fs_ud, use_container_width=True, hide_index=True)
+# Hidden from visible tabs for speed: Season Data UI and FS UD Watcher UI.
+# Data loading remains available via backend cached loaders and learning_data files.
 
 with tab_iq:
     render_baseball_iq_tab(board)
