@@ -24458,6 +24458,274 @@ def render_v3_batter_research_tab(market="FS"):
 V3_BATTER_BOARD_ONLY_PATCH_VERSION = "V3_BATTER_BOARD_ONLY_FS_HRR_2026_06_16"
 
 @st.cache_data(ttl=120, show_spinner=False)
+
+# =========================
+# V3 FS UNDERDOG SOURCE FIX — USE RELATIONSHIP-AWARE FANTASY POINTS PARSER
+# This overrides only the Batter FS Underdog row loader.
+# K engine, IP logic, HRR, Moneyline, and projection formulas are untouched.
+# =========================
+def _v3_fetch_ud_batter_fs_rows():
+    """Relationship-aware Underdog Batter Fantasy Points parser.
+    Fixes cases where Baseball IQ can build Batter FS rows but the Batter FS tab shows ud_rows=0
+    because Underdog stores line, market, appearance, and player in separate related objects.
+    """
+    import re, json
+
+    fs_terms = [
+        "fantasy points", "fantasy score", "batter fantasy", "hitter fantasy",
+        "fantasy pts", "fs"
+    ]
+    hard_bad = re.compile(
+        r"Pitcher|Strikeouts|Pitching Outs|Earned Runs|Hits Allowed|Walks Allowed|"
+        r"Hits\s*\+\s*Runs|H\s*\+\s*R|Total Bases|Home Runs|RBIs?|Runs O/U|"
+        r"Shots|Goals|Assists|Saves|Blocks|Tackles|Strokes|Tourney|Finishing Position|"
+        r"Soccer|NHL|NBA|NFL|WNBA|Golf|Hockey|Basketball|Football|Tennis",
+        re.I,
+    )
+    fs_title_re = re.compile(
+        r"([A-Z][A-Za-zÀ-ÿ.'’\-]+(?:\s+(?:[A-Z][A-Za-zÀ-ÿ.'’\-]+|Jr\.|Sr\.|II|III|IV)){1,5})\s+"
+        r"(?:Fantasy\s+(?:Points|Score)|Fantasy\s+Pts)",
+        re.I,
+    )
+
+    def attrs(obj):
+        if not isinstance(obj, dict):
+            return {}
+        out = {}
+        a = obj.get("attributes")
+        if isinstance(a, dict):
+            out.update(a)
+        for k, v in obj.items():
+            if k not in ["attributes", "relationships", "included", "data"] and k not in out:
+                out[k] = v
+        return out
+
+    def typ(obj, fallback=""):
+        if not isinstance(obj, dict):
+            return str(fallback or "").lower().replace("-", "_")
+        return str(obj.get("type") or fallback or obj.get("_parent_key", "")).lower().replace("-", "_")
+
+    def oid(obj):
+        if not isinstance(obj, dict):
+            return None
+        v = obj.get("id") or attrs(obj).get("id")
+        return str(v) if v not in [None, ""] else None
+
+    def collect(data):
+        out = []
+        def walk(x, parent_key=""):
+            if isinstance(x, dict):
+                y = dict(x)
+                if parent_key and "_parent_key" not in y:
+                    y["_parent_key"] = parent_key
+                out.append(y)
+                for k, v in x.items():
+                    if isinstance(v, (dict, list)):
+                        walk(v, k)
+            elif isinstance(x, list):
+                for item in x:
+                    walk(item, parent_key)
+        walk(data)
+        return out
+
+    def build_maps(objects):
+        by_key, by_id = {}, {}
+        for o in objects:
+            i = oid(o)
+            if not i:
+                continue
+            t = typ(o)
+            for tt in {t, t.rstrip('s'), t + 's'}:
+                by_key[(tt, i)] = o
+            by_id.setdefault(i, []).append(o)
+        return by_key, by_id
+
+    def rel_obj(obj, names, by_key, by_id):
+        if not isinstance(obj, dict):
+            return None
+        rels = obj.get("relationships") or {}
+        for name in names:
+            keys = {name, name.replace("_", "-"), name.replace("_", ""), name.rstrip('s'), name + 's'}
+            for key in keys:
+                node = rels.get(key)
+                if node is None:
+                    continue
+                data = node.get("data") if isinstance(node, dict) else node
+                items = data if isinstance(data, list) else [data]
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    ri = item.get("id")
+                    rt = str(item.get("type") or key or "").lower().replace("-", "_")
+                    if ri in [None, ""]:
+                        continue
+                    for cand_t in [rt, rt.rstrip('s'), rt + 's', key, key.rstrip('s'), key + 's']:
+                        hit = by_key.get((cand_t, str(ri)))
+                        if hit is not None:
+                            return hit
+                    candidates = by_id.get(str(ri), [])
+                    if candidates:
+                        for c in candidates:
+                            ct = typ(c)
+                            if key.rstrip('s') in ct or ct.rstrip('s') in key:
+                                return c
+                        return candidates[0]
+        return None
+
+    def text_from(*objs):
+        parts = []
+        wanted = [
+            "title", "display_title", "name", "player_name", "full_name", "first_name", "last_name",
+            "display_name", "stat", "stat_type", "appearance_stat", "display_stat", "label", "market",
+            "market_name", "sport", "league", "sport_name", "league_name", "description",
+            "over_under", "over_under_title", "scoring_type", "projection_type", "stat_value", "line_score",
+            "appearance_name", "position", "short_name", "abbr_name", "abbreviation"
+        ]
+        for obj in objs:
+            if not isinstance(obj, dict):
+                continue
+            for d in [attrs(obj), obj]:
+                if not isinstance(d, dict):
+                    continue
+                for k in wanted:
+                    v = d.get(k)
+                    if isinstance(v, dict):
+                        for kk in wanted:
+                            if v.get(kk) not in [None, ""]:
+                                parts.append(str(v.get(kk)))
+                    elif v not in [None, ""] and not isinstance(v, (dict, list)):
+                        parts.append(str(v))
+        try:
+            for obj in objs:
+                if isinstance(obj, dict):
+                    parts.append(json.dumps(obj, default=str)[:700])
+        except Exception:
+            pass
+        return " | ".join(parts)
+
+    def looks_like_fs(txt):
+        low = str(txt or "").lower()
+        return any(t in low for t in fs_terms) or bool(fs_title_re.search(str(txt or "")))
+
+    def active_ok(*objs):
+        blob = " ".join(str(attrs(o).get(k, "")) for o in objs if isinstance(o, dict) for k in ["status", "state", "display_status", "over_status", "under_status", "hidden", "active"]).lower()
+        return not any(x in blob for x in ["suspended", "removed", "hidden true", "inactive", "closed", "disabled"])
+
+    def structured_line(*objs):
+        keys = ["stat_value", "line", "over_under_line", "target_value", "line_score", "overUnderLine", "display_stat_value"]
+        for obj in objs:
+            if not isinstance(obj, dict):
+                continue
+            for d in [attrs(obj), obj]:
+                if not isinstance(d, dict):
+                    continue
+                for k in keys:
+                    raw = d.get(k)
+                    v = safe_float(raw, None) if 'safe_float' in globals() else _v3_safe_num(raw, None)
+                    if v is not None and 0.5 <= v <= 45 and abs(v * 2 - round(v * 2)) < 1e-9:
+                        return float(v)
+        return None
+
+    def clean_player_from(*objs):
+        combined = text_from(*objs)
+        m = fs_title_re.search(combined or "")
+        if m:
+            name = m.group(1)
+            return _bp_clean_player_name(name) if "_bp_clean_player_name" in globals() else name.strip()
+        candidates = []
+        for obj in objs:
+            if not isinstance(obj, dict):
+                continue
+            a = attrs(obj)
+            first_last = (str(a.get("first_name", "")).strip() + " " + str(a.get("last_name", "")).strip()).strip()
+            for k in ["display_name", "full_name", "name", "player_name", "title", "description", "appearance_name", "short_name", "abbr_name", "abbreviation"]:
+                v = a.get(k)
+                if isinstance(v, str):
+                    candidates.append(v)
+            if first_last:
+                candidates.append(first_last)
+        cleaned = []
+        for c in candidates:
+            cc = _bp_clean_player_name(c) if "_bp_clean_player_name" in globals() else str(c).strip()
+            if cc and len(_v3_norm_name(cc).split()) >= 1 and len(cc) <= 60:
+                if not re.search(r"\b(Fantasy|Points|Score|Over|Under|Batter|Line|Total|Bases|Pitcher|Strikeouts)\b", cc, re.I):
+                    cleaned.append(cc)
+        if cleaned:
+            return sorted(set(cleaned), key=lambda x: (len(x.split()), len(x)), reverse=True)[0]
+        return ""
+
+    rows = []
+    debug = {"urls": 0, "objects": 0, "line_candidates": 0, "fs_market_hits": 0, "sample_markets": []}
+
+    for url in UNDERDOG_URLS:
+        data = safe_get_json(url, timeout=18)
+        if not data:
+            continue
+        debug["urls"] += 1
+        objects = collect(data)
+        debug["objects"] += len(objects)
+        by_key, by_id = build_maps(objects)
+        line_candidates = []
+        for o in objects:
+            a = attrs(o)
+            t = typ(o)
+            if "over_under_line" in t or any(a.get(k) not in [None, ""] for k in ["stat_value", "line_score", "over_under_line", "target_value", "line"]):
+                line_candidates.append(o)
+        debug["line_candidates"] += len(line_candidates)
+
+        # Relationship path: line -> over_under -> appearance -> player.
+        for line_obj in line_candidates:
+            ou_obj = rel_obj(line_obj, ["over_under", "over_unders"], by_key, by_id)
+            app_obj = rel_obj(ou_obj, ["appearance", "appearances"], by_key, by_id) or rel_obj(line_obj, ["appearance", "appearances"], by_key, by_id)
+            player_obj = rel_obj(app_obj, ["player", "players"], by_key, by_id) or rel_obj(ou_obj, ["player", "players"], by_key, by_id) or rel_obj(line_obj, ["player", "players"], by_key, by_id)
+            blob = text_from(line_obj, ou_obj, app_obj, player_obj)
+            if len(debug["sample_markets"]) < 10 and ("fantasy" in blob.lower() or "points" in blob.lower()):
+                debug["sample_markets"].append(blob[:220])
+            if not looks_like_fs(blob):
+                continue
+            if hard_bad.search(blob):
+                continue
+            if not active_ok(line_obj, ou_obj, app_obj, player_obj):
+                continue
+            line = structured_line(line_obj, ou_obj, app_obj)
+            if line is None:
+                continue
+            player = clean_player_from(player_obj, app_obj, ou_obj, line_obj)
+            if not player:
+                continue
+            debug["fs_market_hits"] += 1
+            rows.append({"Source":"Underdog", "Player":player.strip(), "Market":"Batter FS", "Line":float(line), "Evidence":blob[:350]})
+
+        # Flattened title fallback: e.g. "S. Ohtani Fantasy Points O/U".
+        for obj in objects:
+            blob = text_from(obj)
+            if not blob or not looks_like_fs(blob):
+                continue
+            if hard_bad.search(blob):
+                continue
+            m = fs_title_re.search(blob)
+            if not m:
+                continue
+            line = structured_line(obj)
+            if line is None:
+                continue
+            player = _bp_clean_player_name(m.group(1)) if "_bp_clean_player_name" in globals() else m.group(1).strip()
+            if not player:
+                continue
+            debug["fs_market_hits"] += 1
+            rows.append({"Source":"Underdog", "Player":player.strip(), "Market":"Batter FS", "Line":float(line), "Evidence":"exact FS title fallback: " + blob[:320]})
+
+    try:
+        st.session_state["fs_ud_debug"] = debug
+    except Exception:
+        pass
+
+    dedup = {}
+    for r in rows:
+        key = (_v3_norm_name(r.get("Player")), "Batter FS")
+        dedup.setdefault(key, r)
+    return list(dedup.values())
+
 def _v3_board_only_ud_rows_cached(market="FS"):
     """Return Underdog rows for Batter FS or H+R+RBI.
     This wrapper keeps the app fast and isolates Underdog parsing from tab rendering.
