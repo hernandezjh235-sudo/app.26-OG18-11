@@ -251,7 +251,7 @@ SHARPAPI_KEY = "sk_live_UUk8eejunMDA96uM4vRAQT"
 # Optional manual market odds fallback text is assigned from the Streamlit sidebar at runtime.
 # It is used ONLY for Market/Sharp cards and never changes K projection, BF, IP, pitch count, lineups, or active UD line.
 MANUAL_MARKET_ODDS_TEXT = ""
-SPORTSGAMEODDS_API_KEY = get_secret("SPORTSGAMEODDS_API_KEY", "")
+SPORTSGAMEODDS_API_KEY = get_secret("SPORTSGAMEODDS_API_KEY", "8b324d5f7fb1edd2fccf816f78b91017")  # SGO key added for tester build
 OPTICODDS_API_KEY = get_secret("OPTICODDS_API_KEY", "")
 
 # =========================
