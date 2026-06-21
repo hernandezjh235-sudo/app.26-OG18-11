@@ -246,7 +246,7 @@ def get_secret(key, default=""):
 
 # SharpAPI is intentionally hardcoded ONLY for the pitcher-K market/sharp odds feed.
 # Projection, BF/IP, pitch count, lineup, sabermetric, and DIPS engines do not use this key.
-ODDS_API_KEY = ""  # Disabled: old OddsAPI path is not active in get_sportsbook_k_data().
+ODDS_API_KEY = get_secret("ODDS_API_KEY", "9502336babc0240822c70bad289393f1")  # The Odds API key for MLB pitcher_strikeouts market-only layer
 SHARPAPI_KEY = "sk_live_UUk8eejunMDA96uM4vRAQT"
 # Optional manual market odds fallback text is assigned from the Streamlit sidebar at runtime.
 # It is used ONLY for Market/Sharp cards and never changes K projection, BF, IP, pitch count, lineups, or active UD line.
@@ -1122,153 +1122,6 @@ def extract_probable_pitchers(date_str):
     for _p in locals().get("board", locals().get("rows", locals().get("out", []))):
         if isinstance(_p, dict) and "prop_rows" in _p:
             _p["prop_rows"] = clean_real_prop_debug_rows(_p.get("prop_rows", []))
-    return rows
-
-
-@st.cache_data(ttl=300, show_spinner=False)
-def extract_probable_pitchers_sgo_fallback(date_str):
-    """Fallback pitcher loader when MLB schedule/probablePitcher returns zero.
-
-    Uses SportsGameOdds pitcher-strikeout markets only to rebuild the pitcher list.
-    It does NOT replace Underdog lines or projection math. It only prevents the
-    board from going to 0 when MLB probable pitchers temporarily disappear.
-    """
-    if not SPORTSGAMEODDS_API_KEY:
-        return []
-
-    headers = {"X-Api-Key": SPORTSGAMEODDS_API_KEY, "Authorization": f"Bearer {SPORTSGAMEODDS_API_KEY}"}
-    params = {
-        "apiKey": SPORTSGAMEODDS_API_KEY,
-        "leagueID": "MLB",
-        "oddsAvailable": "true",
-        "oddsPresent": "true",
-        "includeOpposingOdds": "true",
-        "includeAltLines": "true",
-        "limit": 200,
-    }
-    data = safe_get_json(f"{SPORTSGAMEODDS_BASE}/events/", params=params, headers=headers, timeout=20) or {}
-    events = data.get("data") if isinstance(data, dict) else []
-    if not isinstance(events, list):
-        return []
-
-    def _abbr_from_team(t):
-        if not isinstance(t, dict):
-            return ""
-        names = t.get("names") or {}
-        return str(names.get("short") or names.get("medium") or t.get("abbreviation") or "").upper().strip()
-
-    def _player_from_oddid(oddid):
-        m = re.search(r"pitching[_-]strikeouts-([A-Z0-9_]+?)(?:_\d+_MLB)?-game-ou-(?:over|under)", str(oddid), flags=re.I)
-        if not m:
-            return ""
-        raw = m.group(1)
-        raw = re.sub(r"_\d+_MLB$", "", raw, flags=re.I)
-        raw = raw.replace("_", " ").strip()
-        return " ".join(w.capitalize() for w in raw.split())
-
-    @st.cache_data(ttl=86400, show_spinner=False)
-    def _mlb_person_meta_for_sgo_fallback(name):
-        pid = _mlb_search_player_id_by_name(name)
-        if not pid:
-            return {"id": None, "hand": "R", "team_id": None, "team_abbr": ""}
-        try:
-            d = safe_get_json(f"{MLB_BASE}/people/{pid}", timeout=10) or {}
-            p = (d.get("people") or [{}])[0]
-            hand = (((p.get("pitchHand") or {}).get("code")) or "R")
-            tm = p.get("currentTeam") or {}
-            team_id = tm.get("id")
-            team_name = tm.get("name") or ""
-            # best-effort map full team name to app abbreviation
-            team_abbr = ""
-            tn = normalize_name(team_name)
-            for ab, aliases in MLB_TEAM_ALIASES.items():
-                if tn in [normalize_name(x) for x in aliases]:
-                    team_abbr = ab
-                    break
-            return {"id": pid, "hand": hand, "team_id": team_id, "team_abbr": team_abbr}
-        except Exception:
-            return {"id": pid, "hand": "R", "team_id": None, "team_abbr": ""}
-
-    rows, seen = [], set()
-    for ev in events:
-        if not isinstance(ev, dict):
-            continue
-        teams = ev.get("teams") or {}
-        home = teams.get("home") or {}
-        away = teams.get("away") or {}
-        home_ab = _abbr_from_team(home)
-        away_ab = _abbr_from_team(away)
-        # Safe team-id resolver: this fallback can execute before the full
-        # ml_resolve_team_id() helper is defined lower in the Streamlit script.
-        # Never crash the board refresh because of helper definition order.
-        def _safe_team_id(abbr):
-            abbr = str(abbr or "").upper().strip()
-            try:
-                fn = globals().get("ml_resolve_team_id")
-                if callable(fn):
-                    val = fn(abbr)
-                    if val:
-                        return val
-            except Exception:
-                pass
-            return {
-                "ARI":109,"ATL":144,"BAL":110,"BOS":111,"CHC":112,"CWS":145,"CHW":145,
-                "CIN":113,"CLE":114,"COL":115,"DET":116,"HOU":117,"KC":118,"KCR":118,
-                "LAA":108,"LAD":119,"MIA":146,"MIL":158,"MIN":142,"NYM":121,"NYY":147,
-                "ATH":133,"OAK":133,"PHI":143,"PIT":134,"SD":135,"SDP":135,"SEA":136,
-                "SF":137,"SFG":137,"STL":138,"TB":139,"TBR":139,"TEX":140,"TOR":141,"WSH":120,"WAS":120
-            }.get(abbr)
-
-        home_id = _safe_team_id(home_ab)
-        away_id = _safe_team_id(away_ab)
-        matchup = f"{away_ab} @ {home_ab}" if away_ab and home_ab else "MLB"
-        odds = ev.get("odds") or {}
-        if not isinstance(odds, dict):
-            continue
-        for oddid in odds.keys():
-            oid = str(oddid)
-            if "pitching_strikeouts" not in oid.lower() or not oid.lower().endswith("-over"):
-                continue
-            name = _player_from_oddid(oid)
-            if not name:
-                continue
-            meta = _mlb_person_meta_for_sgo_fallback(name)
-            pid = meta.get("id")
-            if not pid:
-                continue
-            key = (date_str, pid, matchup)
-            if key in seen:
-                continue
-            seen.add(key)
-            team_id = meta.get("team_id")
-            team_ab = meta.get("team_abbr") or ""
-            if team_id == home_id:
-                team, opp, opp_id, opp_side = home_ab, away_ab, away_id, "away"
-            elif team_id == away_id:
-                team, opp, opp_id, opp_side = away_ab, home_ab, home_id, "home"
-            else:
-                # If team cannot be resolved, keep matchup but still allow model fallback stats.
-                team, opp, opp_id, opp_side = team_ab or "MLB", "MLB", None, "home"
-            rows.append({
-                "date": date_str,
-                "game_pk": None,
-                "game_time": ev.get("startsAt") or ev.get("startTime") or ev.get("scheduledStartTime") or "",
-                "status": "SGO_FALLBACK",
-                "venue": "",
-                "pitcher_id": pid,
-                "pitcher": name,
-                "hand": meta.get("hand") or "R",
-                "team": team,
-                "team_id": team_id,
-                "opponent": opp,
-                "opp_team_id": opp_id,
-                "home_team": home_ab,
-                "away_team": away_ab,
-                "opp_side": opp_side,
-                "matchup": matchup,
-                "pitcher_confirmed": False,
-                "sgo_pitcher_fallback": True,
-            })
     return rows
 
 def get_pitcher_profile(pid):
@@ -6285,13 +6138,89 @@ def get_sportsbook_event_pitcher_k_lines(event_id, player_name):
     return source_result("Sportsbook", "FOUND", line=consensus, rows=rows, message=f"Found {len(rows)} sportsbook outcomes")
 
 def get_sportsbook_k_data(game_home, game_away, player_name):
-    """Return real sportsbook K odds from SharpAPI for market/sharp only.
+    """Return real sportsbook pitcher-K odds from The Odds API for Market/Sharp only.
 
     Projection independence rule: this source is never used to change pitcher skill,
-    BF, IP, pitch count, lineups, sabermetrics, DIPS, or active Underdog line.
-    It only fills Market / Sharp / agreement cards.
+    BF, IP, pitch count, lineups, sabermetrics, DIPS, or the active Underdog line.
+    It only fills the Market / No-Vig Fair / Final Card Signal advisor layer.
+
+    The Odds API player props are queried one event at a time using:
+      /v4/sports/baseball_mlb/events/{eventId}/odds
+    with markets=pitcher_strikeouts,pitcher_strikeouts_alternate.
     """
-    return get_sharpapi_mlb_pitcher_k_lines(player_name, game_home, game_away)
+    if not ODDS_API_KEY:
+        return source_result("Sportsbook", "DISABLED", rows=[], message="Add The Odds API key")
+
+    all_rows = []
+    events = get_odds_events()
+
+    # First search the scheduled game only. This prevents odds from the wrong game/player
+    # from leaking onto the card when two players share similar names.
+    matching_events = []
+    for ev in events or []:
+        try:
+            if _odds_event_matches_game(ev, game_home, game_away):
+                matching_events.append(ev)
+        except Exception:
+            continue
+
+    # If team names/abbreviations fail to match, safely scan all current MLB events.
+    # This is still card-only; exact player name + exact line checks happen later.
+    search_events = matching_events if matching_events else (events or [])
+
+    for ev in search_events:
+        eid = ev.get("id")
+        if not eid:
+            continue
+        res = get_sportsbook_event_pitcher_k_lines(eid, player_name)
+        rows = res.get("rows", []) if isinstance(res, dict) else []
+        if rows:
+            all_rows.extend(rows)
+
+    if all_rows:
+        line_vals = [safe_float(r.get("Line")) for r in all_rows if safe_float(r.get("Line")) is not None]
+        consensus = float(np.median(line_vals)) if line_vals else None
+        return source_result("Sportsbook", "FOUND", line=consensus, rows=all_rows, message=f"Found {len(all_rows)} Odds API pitcher-K outcomes")
+
+    return source_result("Sportsbook", "NO MATCH", rows=[], message="The Odds API returned no matched pitcher_strikeouts rows for this pitcher/game")
+
+
+def oddsapi_debug_probe():
+    """Small debug helper for The Odds API pitcher_strikeouts feed."""
+    out = {"api_key_present": bool(ODDS_API_KEY)}
+    if not ODDS_API_KEY:
+        out["status"] = "NO_KEY"
+        return out
+    try:
+        events = get_odds_events()
+        out["events_returned"] = len(events or [])
+        out["events_sample"] = [{"id": e.get("id"), "away": e.get("away_team"), "home": e.get("home_team")} for e in (events or [])[:5]]
+        if events:
+            eid = events[0].get("id")
+            data = safe_get_json(
+                f"{ODDS_BASE}/sports/baseball_mlb/events/{eid}/odds",
+                params={"apiKey": ODDS_API_KEY, "regions": "us", "markets": "pitcher_strikeouts,pitcher_strikeouts_alternate", "oddsFormat": "american"},
+                timeout=16,
+            )
+            out["event_odds_type"] = type(data).__name__
+            if isinstance(data, dict):
+                out["event"] = f"{data.get('away_team','')} @ {data.get('home_team','')}"
+                samples = []
+                for b in data.get("bookmakers", []) or []:
+                    for m in b.get("markets", []) or []:
+                        if m.get("key") in ("pitcher_strikeouts", "pitcher_strikeouts_alternate"):
+                            for o in (m.get("outcomes", []) or [])[:4]:
+                                samples.append({"book": b.get("title") or b.get("key"), "market": m.get("key"), "name": o.get("name"), "description": o.get("description"), "point": o.get("point"), "price": o.get("price")})
+                out["pitcher_k_outcome_sample"] = samples[:12]
+                out["status"] = "OK" if samples else "NO_PITCHER_K_OUTCOMES_IN_FIRST_EVENT"
+            else:
+                out["status"] = "EVENT_ODDS_FAILED"
+        else:
+            out["status"] = "NO_EVENTS"
+    except Exception as e:
+        out["status"] = "ERROR"
+        out["error"] = str(e)[:300]
+    return out
 
 def get_manual_market_k_data(player_name, active_line=None):
     """Manual sportsbook odds fallback for Market/Sharp cards only.
@@ -6851,15 +6780,7 @@ def _owp_sgo_collect_priced_pitcher_k_rows(data, player_name):
         return None
 
     def get_parent_price(obj):
-        # Prefer bookOdds for market price, but fall back to fairOdds so the card
-        # can still show no-vig/consensus when the user's SGO plan hides bookmaker rows.
-        v = first_in(obj, [
-            "bookOdds", "book_odds", "consensusOdds", "consensus_odds",
-            "odds", "price", "americanOdds", "american_odds",
-            "fairOdds", "fair_odds", "openBookOdds", "openFairOdds"
-        ])
-        if isinstance(v, dict):
-            v = first_in(v, ["american", "americanOdds", "odds", "price", "value"])
+        v = first_in(obj, ["bookOdds", "book_odds", "odds", "price", "americanOdds", "american_odds", "fairOdds", "fair_odds"])
         if v is None:
             return None
         return safe_float(str(v).replace("+", ""))
@@ -6869,9 +6790,7 @@ def _owp_sgo_collect_priced_pitcher_k_rows(data, player_name):
             return None
         if book_obj.get("available") is False:
             return None
-        v = first_in(book_obj, ["odds", "bookOdds", "book_odds", "price", "americanOdds", "american_odds", "fairOdds", "openOdds", "closeOdds"])
-        if isinstance(v, dict):
-            v = first_in(v, ["american", "americanOdds", "odds", "price", "value"])
+        v = first_in(book_obj, ["odds", "bookOdds", "book_odds", "price", "americanOdds", "american_odds"])
         if v is None:
             return None
         return safe_float(str(v).replace("+", ""))
@@ -7006,19 +6925,6 @@ def _owp_sgo_collect_priced_pitcher_k_rows(data, player_name):
 
     return list(dedup.values())
 
-
-def _owp_sgo_player_id_guess(player_name):
-    """Best-effort SportsGameOdds MLB playerID guess from display name.
-    Example: Chase Burns -> CHASE_BURNS_1_MLB. This is used only to ask SGO
-    for that exact oddID; if SGO returns nothing, normal broad parsing still runs.
-    """
-    t = str(player_name or "").strip()
-    t = re.sub(r"[^A-Za-z0-9\s']+", " ", t)
-    t = re.sub(r"\s+", "_", t.strip()).upper()
-    if not t:
-        return ""
-    return f"{t}_1_MLB"
-
 @st.cache_data(ttl=180, show_spinner=False)
 def get_sportsgameodds_k_data(player_name):
     """SportsGameOdds market-odds feed for pitcher strikeouts.
@@ -7031,31 +6937,13 @@ def get_sportsgameodds_k_data(player_name):
         return source_result("SportsGameOdds", "DISABLED", rows=[], message="Add SPORTSGAMEODDS_API_KEY in sidebar, Streamlit secrets, or environment")
 
     headers = {"X-Api-Key": SPORTSGAMEODDS_API_KEY, "Authorization": f"Bearer {SPORTSGAMEODDS_API_KEY}"}
-    # Direct oddID request comes first. It prevents the app from missing a player
-    # because the general /events page/limit did not include their event or alt line.
-    sgo_pid = _owp_sgo_player_id_guess(player_name)
-    direct_oddids = ""
-    if sgo_pid:
-        direct_oddids = f"pitching_strikeouts-{sgo_pid}-game-ou-over,pitching_strikeouts-{sgo_pid}-game-ou-under"
-
-    endpoints = []
-    if direct_oddids:
-        endpoints.append((f"{SPORTSGAMEODDS_BASE}/events/", {
-            "apiKey": SPORTSGAMEODDS_API_KEY,
-            "leagueID": "MLB",
-            "oddID": direct_oddids,
-            "includeOpposingOdds": "true",
-            "includeAltLines": "true",
-            "bookmakerID": "draftkings,fanduel,betmgm,caesars,espnbet,fanatics,bet365,pinnacle",
-            "limit": 25,
-        }))
-    endpoints += [
+    endpoints = [
         (f"{SPORTSGAMEODDS_BASE}/events/", {
             "apiKey": SPORTSGAMEODDS_API_KEY,
             "oddsAvailable": "true",
             "leagueID": "MLB",
             "includeOpposingOdds": "true",
-            "includeAltLines": "true",
+            "includeAltLines": "false",
             "bookmakerID": "draftkings,fanduel,betmgm,caesars,espnbet,fanatics,bet365,pinnacle",
             "limit": 200,
         }),
@@ -7064,7 +6952,7 @@ def get_sportsgameodds_k_data(player_name):
             "oddsPresent": "true",
             "leagueID": "MLB",
             "includeOpposingOdds": "true",
-            "includeAltLines": "true",
+            "includeAltLines": "false",
             "limit": 200,
         }),
     ]
@@ -10357,14 +10245,17 @@ with st.sidebar:
     use_weather = st.checkbox("Use live weather adjustment", value=True)
     use_umpire = st.checkbox("Use capped umpire tendency", value=True)
     use_xgboost_assist = st.checkbox("Experimental: capped XGBoost assist", value=False)
-    use_sgo = st.checkbox("SportsGameOdds Fair Odds API — AUTO ON", value=True)
-    sgo_sidebar_key = st.text_input("SportsGameOdds API key", value="", type="password", help="Optional override. Tester key is already embedded; leave blank unless replacing it.")
-    st.caption("Fair odds layer is ON by default. If exact sportsbook line matches UD/Line, card will show no-vig fair odds; otherwise NO EXACT MATCH.")
+    st.subheader("Market Odds Advisor")
+    oddsapi_sidebar_key = st.text_input("The Odds API key", value=ODDS_API_KEY, type="password", help="Used only for MLB pitcher_strikeouts odds on player cards. Does not change projections or Underdog lines.")
+    if oddsapi_sidebar_key.strip():
+        ODDS_API_KEY = oddsapi_sidebar_key.strip()
+    st.caption("The Odds API is used only as the fair-odds advisor. Projection engine stays boss; exact UD line match is still required.")
+    if st.checkbox("Show The Odds API debug / connection test", value=False):
+        st.json(oddsapi_debug_probe())
+    use_sgo = st.checkbox("Optional: SportsGameOdds API", value=False)
+    sgo_sidebar_key = st.text_input("SportsGameOdds API key", value="", type="password", help="Optional backup only. Leave OFF while testing The Odds API.")
     if sgo_sidebar_key.strip():
         SPORTSGAMEODDS_API_KEY = sgo_sidebar_key.strip()
-    if st.checkbox("Show SGO debug / connection test", value=False):
-        st.json(sportsgameodds_debug_probe(SPORTSGAMEODDS_API_KEY))
-        st.caption("If HTTP is not 200, the key/plan/auth is failing. If events/odds load but k_like_oddIDs is empty, your SGO plan/feed is not returning MLB pitcher-K props. If k_like exists but cards say NO EXACT MATCH, the parser/exact-line matching is the issue.")
     use_optic = st.checkbox("Optional: OpticOdds API", value=False)
     st.divider()
     st.header("Market Odds Fallback")
@@ -10404,21 +10295,6 @@ if refresh_btn:
     all_rows = []
     for d in dates:
         all_rows.extend(extract_probable_pitchers(d))
-
-    # Safety fallback: if MLB probablePitcher feed returns zero, do NOT kill the board.
-    # Try SportsGameOdds pitcher-K markets only as a pitcher-list fallback. Projection math stays untouched.
-    if not all_rows and use_sgo:
-        sgo_fallback_rows = []
-        for d in dates:
-            sgo_fallback_rows.extend(extract_probable_pitchers_sgo_fallback(d))
-        if sgo_fallback_rows:
-            all_rows = sgo_fallback_rows
-            st.warning(f"MLB probable-pitcher feed returned 0. Loaded {len(all_rows)} pitchers from SGO pitcher-K fallback. Verify matchups/lines before saving.")
-
-    if not all_rows:
-        st.warning("Refresh returned 0 pitchers. Keeping the previous/saved board instead of overwriting it. Try again in 5–10 minutes or switch Today/Tomorrow.")
-        st.session_state.last_refresh_time = now_iso()
-        st.stop()
 
     projections = []
     progress = st.progress(0)
