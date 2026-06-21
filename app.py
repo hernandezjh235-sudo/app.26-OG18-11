@@ -10006,8 +10006,9 @@ with st.sidebar:
     use_weather = st.checkbox("Use live weather adjustment", value=True)
     use_umpire = st.checkbox("Use capped umpire tendency", value=True)
     use_xgboost_assist = st.checkbox("Experimental: capped XGBoost assist", value=False)
-    use_sgo = st.checkbox("Optional: SportsGameOdds API", value=False)
-    sgo_sidebar_key = st.text_input("SportsGameOdds API key", value="", type="password", help="Optional tester key. Stored only in this session; Streamlit secrets/env still work.")
+    use_sgo = st.checkbox("SportsGameOdds Fair Odds API — AUTO ON", value=True)
+    sgo_sidebar_key = st.text_input("SportsGameOdds API key", value="", type="password", help="Optional override. Tester key is already embedded; leave blank unless replacing it.")
+    st.caption("Fair odds layer is ON by default. If exact sportsbook line matches UD/Line, card will show no-vig fair odds; otherwise NO EXACT MATCH.")
     if sgo_sidebar_key.strip():
         SPORTSGAMEODDS_API_KEY = sgo_sidebar_key.strip()
     use_optic = st.checkbox("Optional: OpticOdds API", value=False)
