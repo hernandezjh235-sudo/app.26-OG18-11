@@ -6125,85 +6125,6 @@ def get_manual_market_k_data(player_name, active_line=None):
     return source_result("ManualMarket", "FOUND", rows=rows, line=safe_float(rows[0].get("Line")), message=f"Manual market odds matched: {len(rows)} rows")
 
 @st.cache_data(ttl=600, show_spinner=False)
-
-def _manual_market_odds_text_from_editor_df(df):
-    """Build manual market odds text from rows that already know Pitcher + Line."""
-    try:
-        if df is None or len(df) == 0:
-            return ""
-        out = []
-        for _, r in pd.DataFrame(df).iterrows():
-            pitcher = str(r.get("Pitcher", "") or "").strip()
-            line = safe_float(r.get("Line"))
-            over = str(r.get("Over Odds", "") or "").strip()
-            under = str(r.get("Under Odds", "") or "").strip()
-            book = str(r.get("Book", "") or "Manual").strip()
-            if not pitcher or line is None:
-                continue
-            if not over and not under:
-                continue
-            # Build same format get_manual_market_k_data already understands.
-            out.append(f"{pitcher}, {line}, {over}, {under}, {book}")
-        return "\n".join(out)
-    except Exception:
-        return ""
-
-def _manual_market_editor_seed_from_board(board):
-    """Seed editable odds rows from the current projection board so user only enters odds."""
-    rows = []
-    seen = set()
-    for p in board or []:
-        nm = str(p.get("pitcher") or p.get("Pitcher") or "").strip()
-        ln = safe_float(p.get("line") if p.get("line") is not None else p.get("underdog_line"))
-        if not nm or ln is None:
-            continue
-        key = (nm.lower(), float(ln))
-        if key in seen:
-            continue
-        seen.add(key)
-        rows.append({
-            "Pitcher": nm,
-            "Matchup": str(p.get("matchup") or p.get("Matchup") or ""),
-            "Line": float(ln),
-            "Over Odds": "",
-            "Under Odds": "",
-            "Book": "Manual",
-        })
-    return pd.DataFrame(rows)
-
-def _manual_market_apply_to_board(board, manual_text):
-    """Apply manual odds to already-built rows without touching projection math or lines."""
-    old_text = globals().get("MANUAL_MARKET_ODDS_TEXT", "")
-    globals()["MANUAL_MARKET_ODDS_TEXT"] = manual_text or ""
-    updated = []
-    for p in board or []:
-        q = dict(p)
-        name = str(q.get("pitcher") or q.get("Pitcher") or "").strip()
-        active_line = safe_float(q.get("line") if q.get("line") is not None else q.get("underdog_line"))
-        model_side = str(q.get("pick_side") or "").upper().strip()
-        if model_side not in ["OVER", "UNDER"]:
-            proj = safe_float(q.get("projection"))
-            if proj is not None and active_line is not None:
-                model_side = "OVER" if proj > active_line else "UNDER"
-        try:
-            manual_data = get_manual_market_k_data(name, active_line)
-            priced_rows = manual_data.get("rows", []) if isinstance(manual_data, dict) else []
-            intel = build_market_odds_intelligence(priced_rows, active_line, model_side, q.get("fair_probability"))
-            for k, v in intel.items():
-                q[k] = v
-            if priced_rows:
-                q["price_source"] = "ManualMarket"
-                q["price_is_real"] = True
-                q["sharp_warning"] = "MARKET_INPUT"
-            else:
-                q.setdefault("market_lean", "NO_MARKET")
-                q.setdefault("market_agreement", "NO_REAL_ODDS")
-        except Exception as e:
-            q["market_note"] = f"Manual market apply failed: {e}"
-        updated.append(q)
-    globals()["MANUAL_MARKET_ODDS_TEXT"] = old_text
-    return updated
-
 def get_prizepicks_k_data(player_name):
     data = safe_get_json(PRIZEPICKS_URL, timeout=16)
     if not data:
@@ -9409,6 +9330,18 @@ def render_pick_card(p):
         bars = "<div class='mini-k-bars'>" + "".join(bar_parts) + "</div>"
     statcast_txt = "YES" if p.get("statcast_available") else "NO"
     pitch_type_txt = "YES" if p.get("pitch_type_matchup_available") else "NO"
+    def _card_pct(v):
+        x = safe_float(v, None)
+        if x is None:
+            return "—"
+        if abs(x) <= 1:
+            x *= 100.0
+        return f"{x:.1f}%"
+    market_o_display = p.get('market_over_odds', '—')
+    market_u_display = p.get('market_under_odds', '—')
+    fair_o_display = _card_pct(p.get('market_over_implied'))
+    fair_u_display = _card_pct(p.get('market_under_implied'))
+
     st.markdown(f"""
     <div class="pick-card">
       <div style="display:grid;grid-template-columns:1.3fr .8fr .9fr 1fr 1fr;gap:18px;align-items:center;">
@@ -9441,7 +9374,7 @@ def render_pick_card(p):
         <div class="mobile-info-card"><div class="small-muted">Official Filter</div><div class="kpi-value" style="font-size:17px;">{p.get('official_play_filter', '—')}</div><div class="kpi-sub">{p.get('official_filter_note', '')}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Reliability</div><div class="kpi-value">{p.get('reliability_score', '—')}</div><div class="kpi-sub">{p.get('reliability_label', '')}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Integrity</div><div class="kpi-value">{p.get('decision_integrity_score', '—')}</div><div class="kpi-sub">{p.get('decision_integrity_label', '')}</div></div>
-        <div class="mobile-info-card"><div class="small-muted">Market</div><div class="kpi-value" style="font-size:16px;">{p.get('market_lean', 'NO_MARKET')}</div><div class="kpi-sub">O {p.get('market_over_odds', '—')} | U {p.get('market_under_odds', '—')}<br>Fair O {'' if p.get('market_over_implied') is None else str(round((p.get('market_over_implied') or 0)*100,1))+'%'} | U {'' if p.get('market_under_implied') is None else str(round((p.get('market_under_implied') or 0)*100,1))+'%'}</div></div>
+        <div class="mobile-info-card"><div class="small-muted">Market</div><div class="kpi-value" style="font-size:16px;">{p.get('market_lean', 'NO_MARKET')}</div><div class="kpi-sub">O {market_o_display} | U {market_u_display}<br>Fair O {fair_o_display} | U {fair_u_display}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Sharp / Line</div><div class="kpi-value" style="font-size:16px;">{p.get('sharp_warning', 'NONE')}</div><div class="kpi-sub">{p.get('line_history_grade', '—')} | L10 {p.get('line_l10_avg', '—')}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Umpire Zone</div><div class="kpi-value" style="font-size:16px;">{p.get('umpire_strike_zone_score', '—')}</div><div class="kpi-sub">K nudge {p.get('umpire_k_nudge', 0)} | {p.get('umpire', 'Unknown')}</div></div>
       </div>
@@ -9774,7 +9707,9 @@ with st.sidebar:
     st.header("Controls")
     day_mode = st.radio("Game Feed", ["Today + Tomorrow", "Today", "Tomorrow"], index=0)
     bankroll = st.number_input("Bankroll", min_value=1.0, value=1000.0, step=50.0)
-    default_odds = st.number_input("Default Odds if sportsbook price missing", value=-110.0, step=5.0)
+    # Default odds stays internal only. It is an estimated EV fallback when no real sportsbook price exists.
+    # It does NOT fill Market boxes and does NOT change K projection/BF/IP/Underdog line.
+    default_odds = -110.0
     hide_no_line = st.checkbox("Hide No Real Line picks", value=False)
     only_strong = st.checkbox("Show only strong signals", value=True)
     st.divider()
@@ -9786,71 +9721,20 @@ with st.sidebar:
     use_weather = st.checkbox("Use live weather adjustment", value=True)
     use_umpire = st.checkbox("Use capped umpire tendency", value=True)
     use_xgboost_assist = st.checkbox("Experimental: capped XGBoost assist", value=False)
-    use_sgo = st.checkbox("Optional: SportsGameOdds API", value=False)
-    use_optic = st.checkbox("Optional: OpticOdds API", value=False)
+    # Clean manual-market build: paid/live odds APIs are disabled so they cannot fight the board/cards.
+    use_sgo = False
+    use_optic = False
+    MANUAL_MARKET_ODDS_TEXT = ""
     st.divider()
-    st.header("Market Odds Fallback")
-    st.caption("Manual card odds. It only fills Market/Sharp/Fair cards. It does not change K projection, BF/IP, pitch count, lineups, or Underdog line.")
-
-    # Old paste box stays available, but the easier workflow is the table below after lines load.
-    MANUAL_MARKET_ODDS_TEXT = st.text_area(
-        "Manual sportsbook odds paste box (optional)",
-        value=st.session_state.get("manual_market_odds_text", ""),
-        height=70,
-        placeholder="Pitcher Name, Line, OverOdds, UnderOdds\nCristopher Sanchez, 6.5, -145, +115",
-        help="Optional backup. The table below auto-fills Pitcher + Line after refresh.",
-    )
-
-    current_market_board = st.session_state.get("loaded_picks", [])
-    if current_market_board:
-        st.markdown("#### Add odds to current board")
-        st.caption("Pitcher + Line are auto-filled from the live board. Enter only Over Odds and Under Odds, then apply.")
-        market_seed = _manual_market_editor_seed_from_board(current_market_board)
-        saved_editor = st.session_state.get("manual_market_editor_df")
-        if saved_editor is not None:
-            try:
-                saved_df = pd.DataFrame(saved_editor)
-                # If the loaded board changed, reset to current board rows.
-                if set(saved_df.get("Pitcher", [])) != set(market_seed.get("Pitcher", [])):
-                    saved_df = market_seed
-            except Exception:
-                saved_df = market_seed
-        else:
-            saved_df = market_seed
-
-        edited_market_df = st.data_editor(
-            saved_df,
-            key="manual_market_editor",
-            use_container_width=True,
-            hide_index=True,
-            num_rows="fixed",
-            column_config={
-                "Pitcher": st.column_config.TextColumn("Pitcher", disabled=True),
-                "Matchup": st.column_config.TextColumn("Matchup", disabled=True),
-                "Line": st.column_config.NumberColumn("Line", disabled=True, format="%.1f"),
-                "Over Odds": st.column_config.TextColumn("Over Odds", help="Example: +106 or -145"),
-                "Under Odds": st.column_config.TextColumn("Under Odds", help="Example: -130 or +115"),
-                "Book": st.column_config.TextColumn("Book", help="Optional: FanDuel, DK, VegasInsider, etc."),
-            },
-        )
-        if st.button("✅ Apply manual odds to player cards", use_container_width=True):
-            manual_txt = _manual_market_odds_text_from_editor_df(edited_market_df)
-            st.session_state.manual_market_editor_df = pd.DataFrame(edited_market_df).to_dict("records")
-            st.session_state.manual_market_odds_text = manual_txt
-            st.session_state.loaded_picks = _manual_market_apply_to_board(st.session_state.loaded_picks, manual_txt)
-            st.success("Manual odds applied. Open player cards to see Market + fair no-vig info.")
-            st.rerun()
-    else:
-        st.caption("Refresh the live board first. Then this area will auto-fill Pitcher + Line so you only enter odds.")
-
+    st.header("Manual Market Odds")
+    st.caption("Refresh first. Then this build creates a pitcher/line table where you only enter Over/Under odds. Market odds never change K projection, BF/IP, pitch count, lineups, or Underdog line.")
     if st.button("🧹 Clear Streamlit Cache + Reload Live Lines", use_container_width=True):
         st.cache_data.clear()
         st.session_state.loaded_picks = []
-        st.session_state.manual_market_editor_df = None
-        st.session_state.manual_market_odds_text = ""
         st.session_state.last_refresh_time = None
+        st.session_state.pop("manual_market_table", None)
         st.success("Cache cleared. Now click REFRESH LIVE BOARD again.")
-    st.caption("Refresh does not save official picks. Save only when the board looks right. Optional paid APIs stay OFF unless you have keys.")
+    st.caption("SportsGameOdds and OpticOdds are removed from this build. Manual table controls the Market card only.")
 
 dates = target_dates(day_mode)
 
@@ -9899,9 +9783,6 @@ if refresh_btn:
             log_source_request("make_projection", "ERROR", f"{row.get('pitcher')}: {e}")
         progress.progress((i + 1) / max(1, len(all_rows)))
 
-    manual_txt_after_refresh = st.session_state.get("manual_market_odds_text", "")
-    if manual_txt_after_refresh:
-        projections = _manual_market_apply_to_board(projections, manual_txt_after_refresh)
     st.session_state.loaded_picks = projections
     st.session_state.last_refresh_time = now_iso()
     st.success(f"Refreshed {len(projections)} pitchers. Nothing officially saved yet.")
@@ -9913,6 +9794,120 @@ if save_btn:
         added = save_many_once(st.session_state.loaded_picks)
         st.session_state.last_saved_count = added
         st.success(f"Saved official before-game snapshot. Added {added} new rows.")
+
+
+# =========================
+# CLEAN MANUAL MARKET ODDS TABLE
+# Auto-fills pitcher + active UD line after refresh; user only enters Over/Under odds.
+# This updates Market/Sharp card fields only. It never changes K projection, line, BF/IP, or saved projection logic.
+# =========================
+def _manual_odds_key_from_values(name, line):
+    return (str(name or "").strip().lower(), None if safe_float(line) is None else round(float(safe_float(line)), 2))
+
+def _fmt_manual_price(v):
+    if v is None or str(v).strip() == "":
+        return ""
+    x = safe_float(str(v).replace("+", ""), None)
+    if x is None:
+        return ""
+    return f"{int(x):+d}"
+
+def _manual_market_default_rows(picks):
+    old_rows = st.session_state.get("manual_market_table", []) or []
+    old = {}
+    for r in old_rows:
+        old[_manual_odds_key_from_values(r.get("Pitcher"), r.get("Line"))] = r
+    rows = []
+    seen = set()
+    for pp in picks or []:
+        name = str(pp.get("pitcher") or pp.get("Pitcher") or "").strip()
+        line = safe_float(pp.get("line") if pp.get("line") is not None else pp.get("UD/Line"), None)
+        if not name or line is None:
+            continue
+        key = _manual_odds_key_from_values(name, line)
+        if key in seen:
+            continue
+        seen.add(key)
+        prev = old.get(key, {})
+        rows.append({
+            "Pitcher": name,
+            "Matchup": str(pp.get("matchup") or pp.get("Matchup") or ""),
+            "Line": round(float(line), 1),
+            "Over Odds": _fmt_manual_price(prev.get("Over Odds")),
+            "Under Odds": _fmt_manual_price(prev.get("Under Odds")),
+            "Book": str(prev.get("Book") or ""),
+        })
+    return rows
+
+def _manual_market_apply_to_picks(picks, table_rows):
+    by_key = {}
+    for r in table_rows or []:
+        name = r.get("Pitcher")
+        line = safe_float(r.get("Line"), None)
+        over_px = safe_float(str(r.get("Over Odds", "")).replace("+", ""), None)
+        under_px = safe_float(str(r.get("Under Odds", "")).replace("+", ""), None)
+        if not name or line is None or (over_px is None and under_px is None):
+            continue
+        by_key[_manual_odds_key_from_values(name, line)] = {
+            "name": str(name), "line": float(line), "over": over_px, "under": under_px, "book": str(r.get("Book") or "Manual")
+        }
+    updated = 0
+    out = []
+    for pp in picks or []:
+        p2 = dict(pp)
+        name = str(p2.get("pitcher") or p2.get("Pitcher") or "").strip()
+        line = safe_float(p2.get("line") if p2.get("line") is not None else p2.get("UD/Line"), None)
+        m = by_key.get(_manual_odds_key_from_values(name, line))
+        if m and line is not None:
+            priced_rows = []
+            if m.get("over") is not None:
+                priced_rows.append({"Source":"ManualMarket", "Provider":m.get("book") or "Manual", "Player":name, "Matched Name":name, "Market":"pitcher_strikeouts", "Line":line, "Side":"OVER", "Price":int(m["over"])})
+            if m.get("under") is not None:
+                priced_rows.append({"Source":"ManualMarket", "Provider":m.get("book") or "Manual", "Player":name, "Matched Name":name, "Market":"pitcher_strikeouts", "Line":line, "Side":"UNDER", "Price":int(m["under"])})
+            proj = safe_float(p2.get("projection"), None)
+            model_side = str(p2.get("pick_side") or "").upper()
+            if model_side not in ["OVER", "UNDER"] and proj is not None:
+                model_side = "OVER" if proj > line else "UNDER"
+            intel = build_market_odds_intelligence(priced_rows, line, model_side, None)
+            p2.update(intel)
+            p2["market_source"] = m.get("book") or "Manual"
+            if intel.get("market_agreement") == "AGREE":
+                p2["sharp_warning"] = "MARKET_AGREE"
+            elif intel.get("market_agreement") == "DISAGREE":
+                p2["sharp_warning"] = "MARKET_DISAGREE"
+            else:
+                p2["sharp_warning"] = p2.get("sharp_warning") or "NONE"
+            updated += 1
+        out.append(p2)
+    return out, updated
+
+if st.session_state.get("loaded_picks"):
+    with st.sidebar:
+        st.divider()
+        st.header("Manual Odds Table")
+        st.caption("Auto-filled from the refreshed board. Enter odds only, then press Apply. Exact pitcher + exact line are already locked.")
+        defaults = _manual_market_default_rows(st.session_state.loaded_picks)
+        edited = st.data_editor(
+            pd.DataFrame(defaults),
+            key="manual_market_editor",
+            use_container_width=True,
+            hide_index=True,
+            num_rows="fixed",
+            column_config={
+                "Pitcher": st.column_config.TextColumn("Pitcher", disabled=True),
+                "Matchup": st.column_config.TextColumn("Matchup", disabled=True),
+                "Line": st.column_config.NumberColumn("Line", disabled=True, format="%.1f"),
+                "Over Odds": st.column_config.TextColumn("Over Odds", help="Example: +106 or -145"),
+                "Under Odds": st.column_config.TextColumn("Under Odds", help="Example: -130 or +115"),
+                "Book": st.column_config.TextColumn("Book", help="Optional: FanDuel, DK, consensus, etc."),
+            },
+        )
+        if st.button("✅ Apply manual odds to player cards", use_container_width=True):
+            table_records = edited.to_dict("records") if hasattr(edited, "to_dict") else list(edited or [])
+            st.session_state.manual_market_table = table_records
+            st.session_state.loaded_picks, count = _manual_market_apply_to_picks(st.session_state.loaded_picks, table_records)
+            st.success(f"Applied manual market odds to {count} player card(s).")
+        st.caption("Use Refresh first, enter odds, then Apply. Save official snapshot only after cards/slates look right.")
 
 saved = load_json(PICK_LOG, [])
 
@@ -11237,6 +11232,17 @@ def render_kproj_pitcher_card(p):
         sign = '+' if impact >= 0 else ''
         attr_items.append(f"<div style='display:flex;justify-content:space-between;gap:10px;border-top:1px solid rgba(255,255,255,.07);padding:5px 0;'><span>{html.escape(str(ar.get('Layer','Layer')))}</span><b>{sign}{impact:.2f} K</b></div>")
     attr_html = "".join(attr_items) if attr_items else "<div class='kpi-sub'>No attribution rows available</div>"
+    def _card_pct(v):
+        x = safe_float(v, None)
+        if x is None:
+            return "—"
+        if abs(x) <= 1:
+            x *= 100.0
+        return f"{x:.1f}%"
+    market_o_display = p.get('market_over_odds', '—')
+    market_u_display = p.get('market_under_odds', '—')
+    fair_o_display = _card_pct(p.get('market_over_implied'))
+    fair_u_display = _card_pct(p.get('market_under_implied'))
     st.markdown(f"""
     <div class="pick-card" style="border-color:rgba(90,100,255,.45);box-shadow:0 0 26px rgba(90,100,255,.16);">
       <div style="display:grid;grid-template-columns:1.25fr .75fr .75fr .75fr .9fr;gap:18px;align-items:center;">
@@ -11255,7 +11261,7 @@ def render_kproj_pitcher_card(p):
       <div class="hr-soft"></div>
       <div class="mobile-decision-grid">
         <div class="mobile-info-card"><div class="small-muted">Integrity</div><div class="kpi-value">{p.get('decision_integrity_score', '—')}</div><div class="kpi-sub">{p.get('decision_integrity_label', '')}</div></div>
-        <div class="mobile-info-card"><div class="small-muted">Market</div><div class="kpi-value" style="font-size:16px;">{p.get('market_lean', 'NO_MARKET')}</div><div class="kpi-sub">O {p.get('market_over_odds', '—')} | U {p.get('market_under_odds', '—')}<br>Fair O {'' if p.get('market_over_implied') is None else str(round((p.get('market_over_implied') or 0)*100,1))+'%'} | U {'' if p.get('market_under_implied') is None else str(round((p.get('market_under_implied') or 0)*100,1))+'%'}</div></div>
+        <div class="mobile-info-card"><div class="small-muted">Market</div><div class="kpi-value" style="font-size:16px;">{p.get('market_lean', 'NO_MARKET')}</div><div class="kpi-sub">O {market_o_display} | U {market_u_display}<br>Fair O {fair_o_display} | U {fair_u_display}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Sharp</div><div class="kpi-value" style="font-size:18px;">{p.get('sharp_warning', 'NONE')}</div><div class="kpi-sub">{p.get('market_agreement', '')}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Line Audit</div><div class="kpi-value" style="font-size:16px;">{p.get('line_history_grade', '—')}</div><div class="kpi-sub">L10 {p.get('line_l10_avg', '—')} | HR {'' if p.get('line_recent_hit_rate') is None else str(round((p.get('line_recent_hit_rate') or 0)*100))+'%'}</div></div>
         <div class="mobile-info-card"><div class="small-muted">Innings</div><div class="kpi-value" style="font-size:18px;">{p.get('projected_ip', '—')} IP</div><div class="kpi-sub">Pull: {p.get('early_pull_label', '—')} | Pitches {p.get('projected_pitches', '—')}</div></div>
