@@ -27953,6 +27953,406 @@ def ml_build_board(board):
         df = df.sort_values(['_sort_status', 'ML Edge %'], ascending=[True, False]).drop(columns=['_sort_status'])
     return df
 
+
+
+# =============================================================
+# ONE WAY PICKZ SAFE ADD-ON: FANTASY PITCHER SIM + MONEYLINE SIM/GRADING
+# Version: OW_SAFE_FS_ML_SIM_2026_06_28
+#
+# Safety contract:
+# - DOES NOT change K Upside / K-prop projection math.
+# - DOES NOT change K environment, K decisions, BF/IP generation, or K grading.
+# - Fantasy Pitcher uses the existing K/IP/ER/Win/QS outputs as inputs only.
+# - Fantasy Pitcher does NOT pull fantasy lines.
+# - Moneyline runs a separate game simulation and optional grading log.
+# =============================================================
+OW_SAFE_FS_ML_SIM_VERSION = "OW_SAFE_FS_ML_SIM_2026_06_28"
+
+try:
+    ML_PICK_LOG
+except Exception:
+    ML_PICK_LOG = os.path.join(STORAGE_DIR, "moneyline_pick_log.json")
+try:
+    ML_RESULT_LOG
+except Exception:
+    ML_RESULT_LOG = os.path.join(STORAGE_DIR, "moneyline_result_log.json")
+
+
+def _ow_num(x, default=0.0):
+    try:
+        if x is None or x == "" or str(x).strip() in ["—", "None", "nan"]:
+            return default
+        v = float(str(x).replace("%", "").replace(",", "").strip())
+        if pd.isna(v):
+            return default
+        return v
+    except Exception:
+        return default
+
+
+def _ow_clip(x, lo, hi, default=0.0):
+    try:
+        return max(lo, min(hi, float(x)))
+    except Exception:
+        return default
+
+
+def _ow_american_from_prob(prob_pct):
+    """Convert win probability percent to fair American odds."""
+    p = _ow_clip(prob_pct, 1.0, 99.0, 50.0) / 100.0
+    if p >= 0.5:
+        return int(round(-100.0 * p / max(1.0 - p, 0.0001)))
+    return int(round(100.0 * (1.0 - p) / max(p, 0.0001)))
+
+
+def _ow_line_source_date():
+    try:
+        return datetime.now().strftime("%Y-%m-%d")
+    except Exception:
+        return ""
+
+
+# ---------- Pitcher Fantasy Simulator (Underdog scoring; no fantasy lines) ----------
+_prev_ow_build_pitcher_fs_board = globals().get("build_pitcher_fs_board", None)
+
+
+def _ow_fs_simulate_row(row):
+    """Monte Carlo fantasy pitcher score using Underdog pitcher scoring.
+
+    Scoring used:
+      Win +5, Quality Start +5, Strikeout +3, Inning Pitched +3, Earned Run -3.
+    Hits/walks remain audit/context only and are NOT subtracted from the official fantasy score.
+    """
+    name = str(row.get("Pitcher") or row.get("pitcher") or "")
+    matchup = str(row.get("Matchup") or row.get("matchup") or "")
+    k_mu = _ow_clip(row.get("K Projection") or row.get("K PROJ") or row.get("Line-Aware Smart Final K Projection"), 0.0, 14.0, 4.5)
+    ip_mu = _ow_clip(row.get("IP Projection") or row.get("IP Floor") or row.get("IP"), 1.0, 8.0, 5.0)
+    er_mu = _ow_clip(row.get("ER Projection") or row.get("Projected ER") or row.get("Expected ER"), 0.0, 8.0, 2.5)
+    win_pct = _ow_clip(row.get("Win %") or row.get("Win Probability") or row.get("Moneyline Win %"), 0.0, 100.0, 45.0)
+    qs_pct = _ow_clip(row.get("QS %") or row.get("Quality Start %"), 0.0, 100.0, 18.0)
+
+    # Stable deterministic seed so refreshes do not randomly change fantasy projections.
+    try:
+        rng = stable_rng("PITCHER_FS_SIM", OW_SAFE_FS_ML_SIM_VERSION, name, matchup, round(k_mu, 2), round(ip_mu, 2), round(er_mu, 2), round(win_pct, 1), round(qs_pct, 1))
+    except Exception:
+        rng = np.random.default_rng(42)
+
+    sims = 2500
+    # Conservative variance: K and ER are noisy; IP is bounded around the existing K-engine IP projection.
+    k_vals = rng.poisson(max(k_mu, 0.05), sims)
+    ip_vals = rng.normal(ip_mu, 0.70, sims)
+    ip_vals = np.clip(ip_vals, 1.0, 8.0)
+    # Baseball IP is in thirds; approximate to nearest third.
+    ip_vals = np.round(ip_vals * 3.0) / 3.0
+    er_vals = rng.poisson(max(er_mu, 0.05), sims)
+    win_vals = rng.binomial(1, _ow_clip(win_pct / 100.0, 0.02, 0.90, 0.45), sims)
+    qs_vals = rng.binomial(1, _ow_clip(qs_pct / 100.0, 0.00, 0.85, 0.18), sims)
+
+    scores = (k_vals * 3.0) + (ip_vals * 3.0) + (win_vals * 5.0) + (qs_vals * 5.0) - (er_vals * 3.0)
+    floor = float(np.percentile(scores, 20))
+    median = float(np.percentile(scores, 50))
+    ceiling = float(np.percentile(scores, 80))
+    mean = float(np.mean(scores))
+    vol = float(np.std(scores))
+    # Confidence is a stability label, not a fantasy line win probability.
+    conf = _ow_clip(100.0 - (vol * 4.0), 35.0, 92.0, 60.0)
+    if mean >= 30 and floor >= 20:
+        grade = "A"
+    elif mean >= 26 and floor >= 17:
+        grade = "B+"
+    elif mean >= 22:
+        grade = "B"
+    elif mean >= 18:
+        grade = "C"
+    else:
+        grade = "D / Risk"
+    return {
+        "FS Projection": round(mean, 2),
+        "Floor": round(floor, 2),
+        "Median": round(median, 2),
+        "Ceiling": round(ceiling, 2),
+        "FS Volatility": round(vol, 2),
+        "Confidence %": round(conf, 1),
+        "Fantasy Grade": grade,
+        "FS Sim K Mean": round(float(np.mean(k_vals)), 2),
+        "FS Sim IP Mean": round(float(np.mean(ip_vals)), 2),
+        "FS Sim ER Mean": round(float(np.mean(er_vals)), 2),
+        "FS Win % Used": round(win_pct, 1),
+        "FS QS % Used": round(qs_pct, 1),
+        "Pitcher FS Formula": "Underdog: K*3 + IP*3 + Win*5 + QS*5 - ER*3",
+        "Pitcher FS Version": OW_SAFE_FS_ML_SIM_VERSION,
+        "Fantasy Line Source": "NO_FANTASY_LINES_USED",
+    }
+
+
+def build_pitcher_fs_board(board=None):
+    if _prev_ow_build_pitcher_fs_board is None:
+        return pd.DataFrame()
+    df = _prev_ow_build_pitcher_fs_board(board)
+    if df is None or df.empty:
+        return df
+    rows = []
+    for _, rr in df.iterrows():
+        row = rr.to_dict()
+        try:
+            row.update(_ow_fs_simulate_row(row))
+        except Exception as _fs_e:
+            row["Pitcher FS Version"] = OW_SAFE_FS_ML_SIM_VERSION + "_FALLBACK"
+            row["Fantasy Sim Error"] = str(_fs_e)[:120]
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+_prev_ow_render_pitcher_fs_tab = globals().get("render_pitcher_fs_tab", None)
+
+
+def render_pitcher_fs_tab(board=None):
+    st.subheader("Pitcher Fantasy — Underdog Simulation Engine")
+    st.caption("K Upside is untouched. No fantasy lines are pulled. This sim uses existing K/IP/ER/Win/QS inputs and Underdog pitcher scoring: Win +5, QS +5, K +3, IP +3, ER -3.")
+    df = build_pitcher_fs_board(board)
+    if df is None or df.empty:
+        st.info("No Pitcher FS rows yet. Refresh K PROJ / UPSIDE first.")
+        return
+    try:
+        df_show = df.sort_values(["FS Projection", "Floor"], ascending=[False, False])
+    except Exception:
+        df_show = df
+    summary_cols = [c for c in [
+        "Pitcher", "Matchup", "FS Projection", "Floor", "Median", "Ceiling", "Fantasy Grade", "Confidence %",
+        "K Projection", "IP Projection", "ER Projection", "Win %", "QS %", "FS Volatility", "Fantasy Line Source", "Pitcher FS Version"
+    ] if c in df_show.columns]
+    st.dataframe(df_show[summary_cols] if summary_cols else df_show, use_container_width=True, hide_index=True)
+    with st.expander("Full Pitcher Fantasy Simulation Audit", expanded=False):
+        st.dataframe(df_show, use_container_width=True, hide_index=True)
+    try:
+        _render_fs_cards(df_show, kind="pitcher")
+    except Exception:
+        pass
+
+
+# ---------- Moneyline Game Simulator + grading ----------
+_prev_ow_ml_build_board = globals().get("ml_build_board", None)
+
+
+def _ow_ml_simulate_game_row(row):
+    matchup = str(row.get("Matchup") or "")
+    try:
+        away, home = matchup.split(" @ ", 1)
+    except Exception:
+        away, home = "AWAY", "HOME"
+    ar = _ow_clip(row.get("Away Projected Runs"), 0.5, 9.5, 4.3)
+    hr = _ow_clip(row.get("Home Projected Runs"), 0.5, 9.5, 4.3)
+    asp = _ow_clip(row.get("Away SP Strength"), 0, 100, 50)
+    hsp = _ow_clip(row.get("Home SP Strength"), 0, 100, 50)
+    abp = _ow_clip(row.get("Away Bullpen"), 0, 100, 50)
+    hbp = _ow_clip(row.get("Home Bullpen"), 0, 100, 50)
+    try:
+        rng = stable_rng("ML_GAME_SIM", OW_SAFE_FS_ML_SIM_VERSION, matchup, round(ar, 2), round(hr, 2), round(asp, 1), round(hsp, 1), round(abp, 1), round(hbp, 1))
+    except Exception:
+        rng = np.random.default_rng(43)
+    sims = 4000
+    # Simulate baseball run outcomes. Pitcher/bullpen strength slightly shifts run means,
+    # but does not alter K props.
+    adj_ar = _ow_clip(ar - ((hsp - 50.0) * 0.012) - ((hbp - 50.0) * 0.006), 0.4, 10.0, ar)
+    adj_hr = _ow_clip(hr - ((asp - 50.0) * 0.012) - ((abp - 50.0) * 0.006), 0.4, 10.0, hr)
+    away_runs = rng.poisson(adj_ar, sims)
+    home_runs = rng.poisson(adj_hr, sims)
+    ties = away_runs == home_runs
+    # Approximate extra innings: slight home edge in ties.
+    if ties.any():
+        home_extra = rng.binomial(1, 0.53, int(ties.sum()))
+        away_runs[ties] += (1 - home_extra)
+        home_runs[ties] += home_extra
+    away_win = float(np.mean(away_runs > home_runs) * 100.0)
+    home_win = 100.0 - away_win
+    pick = away if away_win >= home_win else home
+    pick_prob = max(away_win, home_win)
+    score_proj = f"{away} {np.mean(away_runs):.1f} - {home} {np.mean(home_runs):.1f}"
+    return {
+        "ML Sim Away Win %": round(away_win, 1),
+        "ML Sim Home Win %": round(home_win, 1),
+        "ML Sim Pick": pick,
+        "ML Sim Pick %": round(pick_prob, 1),
+        "ML Sim Fair Odds": _ow_american_from_prob(pick_prob),
+        "ML Sim Projected Score": score_proj,
+        "ML Sim Run Diff": round(abs(np.mean(away_runs) - np.mean(home_runs)), 2),
+        "ML Sim Version": OW_SAFE_FS_ML_SIM_VERSION,
+    }
+
+
+def ml_build_board(board):
+    if _prev_ow_ml_build_board is None:
+        return pd.DataFrame()
+    df = _prev_ow_ml_build_board(board)
+    if df is None or df.empty:
+        return df
+    rows = []
+    for _, rr in df.iterrows():
+        row = rr.to_dict()
+        try:
+            sim = _ow_ml_simulate_game_row(row)
+            row.update(sim)
+            market_available = row.get("Away Market %") is not None and row.get("Home Market %") is not None
+            matchup = str(row.get("Matchup") or "")
+            try:
+                away, home = matchup.split(" @ ", 1)
+            except Exception:
+                away, home = "", ""
+            sim_pick = sim.get("ML Sim Pick")
+            sim_prob = _ow_num(sim.get("ML Sim Pick %"), 50)
+            market_pct = None
+            if market_available:
+                market_pct = _ow_num(row.get("Away Market %") if sim_pick == away else row.get("Home Market %"), None)
+            edge = None if market_pct is None else round(sim_prob - market_pct, 1)
+            row["ML Sim Market Edge %"] = edge
+            # Final ML label is conservative: simulation must agree with the underlying ML 3.0 model pick.
+            old_pick = str(row.get("Pick") or "")
+            agrees_old = (old_pick == sim_pick)
+            if market_available:
+                if edge is not None and edge >= 5.0 and agrees_old and sim_prob >= 55.0:
+                    row["ML Final Status"] = "STRONG ML"
+                elif edge is not None and edge >= 2.5 and sim_prob >= 53.0:
+                    row["ML Final Status"] = "LEAN ML"
+                else:
+                    row["ML Final Status"] = "PASS"
+            else:
+                if sim_prob >= 58.0 and agrees_old:
+                    row["ML Final Status"] = "MODEL LEAN"
+                else:
+                    row["ML Final Status"] = "PASS — NO MARKET"
+            row["ML Final Pick"] = sim_pick
+            row["ML Final Confidence %"] = round(_ow_clip(45 + (sim_prob - 50) * 2.0 + (5 if agrees_old else -4), 35, 88, 55), 1)
+            row["ML Version"] = str(row.get("ML Version") or "") + " + " + OW_SAFE_FS_ML_SIM_VERSION
+        except Exception as _ml_e:
+            row["ML Sim Version"] = OW_SAFE_FS_ML_SIM_VERSION + "_FALLBACK"
+            row["ML Sim Error"] = str(_ml_e)[:120]
+        rows.append(row)
+    out = pd.DataFrame(rows)
+    if not out.empty:
+        order = {"STRONG ML": 0, "LEAN ML": 1, "MODEL LEAN": 2, "PASS": 3, "PASS — NO MARKET": 4}
+        if "ML Final Status" in out.columns:
+            out["_ow_sort"] = out["ML Final Status"].astype(str).map(lambda x: order.get(x, 9))
+            edge_col = "ML Sim Market Edge %" if "ML Sim Market Edge %" in out.columns else "ML Edge %"
+            out = out.sort_values(["_ow_sort", edge_col], ascending=[True, False], na_position="last").drop(columns=["_ow_sort"])
+    return out
+
+
+def _ow_save_moneyline_board(df):
+    if df is None or df.empty:
+        return {"saved": 0, "reason": "empty_board"}
+    existing = load_json(ML_PICK_LOG, [])
+    if not isinstance(existing, list):
+        existing = []
+    today = _ow_line_source_date()
+    added = 0
+    for _, rr in df.iterrows():
+        r = rr.to_dict()
+        status = str(r.get("ML Final Status") or r.get("Status") or "")
+        if not any(x in status for x in ["STRONG", "LEAN", "MODEL LEAN"]):
+            continue
+        key = f"{today}|{r.get('Matchup')}|{r.get('ML Final Pick') or r.get('Pick')}|{r.get('ML Sim Pick %') or r.get('ML Confidence %')}"
+        if any(str(x.get("ml_key")) == key for x in existing if isinstance(x, dict)):
+            continue
+        r.update({"date": today, "ml_key": key, "graded_result": "PENDING", "saved_at": datetime.now().isoformat(), "ML Save Version": OW_SAFE_FS_ML_SIM_VERSION})
+        existing.append(r)
+        added += 1
+    save_json(ML_PICK_LOG, existing)
+    return {"saved": added, "total_saved_rows": len(existing), "path": ML_PICK_LOG}
+
+
+def _ow_fetch_final_scores_for_dates(date_list):
+    scores = {}
+    for d in date_list or []:
+        try:
+            url = f"https://statsapi.mlb.com/api/v1/schedule?sportId=1&date={d}"
+            data = requests.get(url, timeout=8).json()
+            for day in data.get("dates", []):
+                for g in day.get("games", []):
+                    status = (g.get("status") or {}).get("detailedState", "")
+                    if "Final" not in status and status not in ["Game Over", "Completed Early"]:
+                        continue
+                    away_team = ((g.get("teams") or {}).get("away") or {}).get("team", {}).get("abbreviation")
+                    home_team = ((g.get("teams") or {}).get("home") or {}).get("team", {}).get("abbreviation")
+                    away_score = ((g.get("teams") or {}).get("away") or {}).get("score")
+                    home_score = ((g.get("teams") or {}).get("home") or {}).get("score")
+                    if away_team and home_team and away_score is not None and home_score is not None:
+                        # Normalize known aliases.
+                        away_team = {"WSN":"WSH", "CHW":"CWS", "KCR":"KC"}.get(str(away_team).upper(), str(away_team).upper())
+                        home_team = {"WSN":"WSH", "CHW":"CWS", "KCR":"KC"}.get(str(home_team).upper(), str(home_team).upper())
+                        scores[f"{away_team} @ {home_team}"] = {"away": away_team, "home": home_team, "away_score": int(away_score), "home_score": int(home_score), "winner": away_team if int(away_score) > int(home_score) else home_team}
+        except Exception:
+            continue
+    return scores
+
+
+def _ow_grade_moneyline_saved():
+    picks = load_json(ML_PICK_LOG, [])
+    if not isinstance(picks, list) or not picks:
+        return {"graded": 0, "saved": 0, "reason": "no_saved_moneyline_picks"}
+    dates_to_check = sorted({str(p.get("date") or "") for p in picks if isinstance(p, dict) and str(p.get("graded_result") or "PENDING") == "PENDING"})
+    scores = _ow_fetch_final_scores_for_dates(dates_to_check)
+    results = load_json(ML_RESULT_LOG, [])
+    if not isinstance(results, list):
+        results = []
+    graded = 0
+    for p in picks:
+        if not isinstance(p, dict) or str(p.get("graded_result") or "PENDING") != "PENDING":
+            continue
+        matchup = str(p.get("Matchup") or "")
+        sc = scores.get(matchup)
+        if not sc:
+            continue
+        pick = str(p.get("ML Final Pick") or p.get("Pick") or "").upper()
+        result = "WIN" if pick == sc.get("winner") else "LOSS"
+        p["graded_result"] = result
+        p["actual_winner"] = sc.get("winner")
+        p["final_score"] = f"{sc.get('away')} {sc.get('away_score')} - {sc.get('home')} {sc.get('home_score')}"
+        p["graded_at"] = datetime.now().isoformat()
+        p["ML Grade Version"] = OW_SAFE_FS_ML_SIM_VERSION
+        results.append(dict(p))
+        graded += 1
+    save_json(ML_PICK_LOG, picks)
+    save_json(ML_RESULT_LOG, results)
+    return {"graded": graded, "pending_checked_dates": dates_to_check, "final_scores_found": len(scores), "pick_log": ML_PICK_LOG, "result_log": ML_RESULT_LOG}
+
+
+_prev_ow_render_moneyline_edge_tab = globals().get("render_moneyline_edge_tab", None)
+
+
+def render_moneyline_edge_tab(board, dates=None):
+    st.markdown("### 💰 Moneyline Edge — Simulation 2.0")
+    st.caption("Separate game simulator. K Upside/K props are untouched. Market odds are used only as a value/reality check when available.")
+    df = ml_build_board(board)
+    if df is None or df.empty:
+        st.info("No Moneyline rows yet.")
+        return
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("💾 Save Moneyline Official Board", use_container_width=True):
+            st.write(_ow_save_moneyline_board(df))
+    with c2:
+        if st.button("✅ Grade Saved Moneyline Picks", use_container_width=True):
+            st.write(_ow_grade_moneyline_saved())
+    top_cols = [c for c in [
+        "Matchup", "ML Final Pick", "ML Final Status", "ML Sim Pick %", "ML Sim Fair Odds", "ML Sim Market Edge %",
+        "ML Sim Projected Score", "Projected Score", "ML Final Confidence %", "ML Data Quality", "Away SP", "Home SP", "ML Version"
+    ] if c in df.columns]
+    st.dataframe(df[top_cols] if top_cols else df, use_container_width=True, hide_index=True)
+    with st.expander("Full Moneyline Simulation Audit", expanded=False):
+        st.dataframe(df, use_container_width=True, hide_index=True)
+    ml_results = load_json(ML_RESULT_LOG, [])
+    if isinstance(ml_results, list) and ml_results:
+        rdf = pd.DataFrame(ml_results)
+        if "graded_result" in rdf.columns:
+            finished = rdf[rdf["graded_result"].isin(["WIN", "LOSS"])]
+            if not finished.empty:
+                a,b,c = st.columns(3)
+                a.metric("ML Graded", len(finished))
+                b.metric("ML Win Rate", f"{finished['graded_result'].eq('WIN').mean()*100:.1f}%")
+                c.metric("Last Result", str(finished.tail(1).iloc[0].get("graded_result")))
+                with st.expander("Moneyline Graded History", expanded=False):
+                    st.dataframe(finished.tail(100), use_container_width=True, hide_index=True)
+
 # Keep the existing Moneyline UI, but its data now comes from ML_30_UPGRADE_VERSION.
 
 
